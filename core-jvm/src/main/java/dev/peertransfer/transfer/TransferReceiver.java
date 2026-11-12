@@ -30,21 +30,39 @@ import java.security.SecureRandom;
  */
 public final class TransferReceiver implements AutoCloseable {
 
+    /** Eight in-flight chunks: enough to cover a hotspot round trip without unbounded buffering. */
+    public static final int DEFAULT_ACK_WINDOW = 8;
+
     private final ServerSocket serverSocket;
     private final byte[] secret;
     private final Path destinationDir;
     private final long maxBytes;
+    private final int ackWindowChunks;
 
     private Socket socket;
     private SecureChannel channel;
 
     public TransferReceiver(byte[] secret, Path destinationDir, long maxBytes) throws IOException {
+        this(secret, destinationDir, maxBytes, DEFAULT_ACK_WINDOW);
+    }
+
+    /**
+     * @param ackWindowChunks how many chunks the sender may run ahead before it waits for an ack.
+     *                        Larger values keep a hotspot link busy instead of idling on round trips;
+     *                        1 is stop-and-wait.
+     */
+    public TransferReceiver(byte[] secret, Path destinationDir, long maxBytes, int ackWindowChunks)
+            throws IOException {
         if (secret == null || secret.length != 16) {
             throw new IllegalArgumentException("secret must be 16 bytes");
+        }
+        if (ackWindowChunks < 1 || ackWindowChunks > 1024) {
+            throw new IllegalArgumentException("ack window out of range: " + ackWindowChunks);
         }
         this.secret = secret.clone();
         this.destinationDir = destinationDir;
         this.maxBytes = maxBytes;
+        this.ackWindowChunks = ackWindowChunks;
         this.serverSocket = new ServerSocket(0, 1, java.net.InetAddress.getLoopbackAddress());
         Files.createDirectories(destinationDir);
     }
@@ -86,7 +104,7 @@ public final class TransferReceiver implements AutoCloseable {
             throw new IOException("prepare failed authentication", e);
         }
         if (prepare.size > maxBytes) {
-            frames.write(channel.seal(Messages.encodePrepareAck(Messages.STATUS_REJECTED, 0)));
+            frames.write(channel.seal(Messages.encodePrepareAck(Messages.STATUS_REJECTED, 0, 1)));
             throw new IOException("offered file exceeds the configured limit: " + prepare.size);
         }
 
@@ -97,9 +115,11 @@ public final class TransferReceiver implements AutoCloseable {
             contiguous = 0L;
             Files.deleteIfExists(tempPath);
         }
-        frames.write(channel.seal(Messages.encodePrepareAck(Messages.STATUS_OK, contiguous)));
+        frames.write(channel.seal(
+                Messages.encodePrepareAck(Messages.STATUS_OK, contiguous, ackWindowChunks)));
 
         MessageDigest wholeFile = newDigest();
+        int chunksSinceAck = 0;
         try (RandomAccessFile file = new RandomAccessFile(tempPath.toFile(), "rw")) {
             if (contiguous > 0) {
                 // Re-hash the resumed prefix so the whole-file digest stays meaningful.
@@ -148,7 +168,15 @@ public final class TransferReceiver implements AutoCloseable {
                     file.write(chunk.data);
                     wholeFile.update(chunk.data);
                     contiguous += chunk.data.length;
-                    frames.write(channel.seal(Messages.encodeChunkAck(Messages.STATUS_OK, contiguous)));
+                    chunksSinceAck++;
+                    // Ack on the window boundary and once at the end, not after every chunk: on a
+                    // hotspot link a per-chunk ack would make throughput a function of round-trip
+                    // latency rather than of radio speed.
+                    if (chunksSinceAck >= ackWindowChunks || contiguous == prepare.size) {
+                        frames.write(channel.seal(
+                                Messages.encodeChunkAck(Messages.STATUS_OK, contiguous)));
+                        chunksSinceAck = 0;
+                    }
                     continue;
                 }
                 if (opcode == Messages.OP_DONE) {

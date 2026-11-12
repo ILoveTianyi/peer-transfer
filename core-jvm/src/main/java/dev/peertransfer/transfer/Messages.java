@@ -98,32 +98,54 @@ public final class Messages {
         return new Prepare(new String(name, StandardCharsets.UTF_8), size, hash);
     }
 
-    public static byte[] encodePrepareAck(byte status, long resumeOffset) {
-        byte[] payload = new byte[17];
+    /**
+     * PREPARE_ACK: status(1) || resumeOffset(8) || ackWindow(4).
+     *
+     * <p>The window is how many chunks the sender may have in flight before it must read an ack. The
+     * receiver dictates it because it knows its own write speed; a window of 1 degenerates to
+     * stop-and-wait, which is what a single-chunk-per-ack design would force over a link with any
+     * round-trip latency.
+     */
+    public static byte[] encodePrepareAck(byte status, long resumeOffset, int ackWindow) {
+        byte[] payload = new byte[21];
         payload[0] = OP_PREPARE_ACK;
         payload[1] = status;
         for (int i = 0; i < 8; i++) {
             payload[9 + i] = (byte) (resumeOffset >>> (56 - 8 * i));
         }
+        for (int i = 0; i < 4; i++) {
+            payload[17 + i] = (byte) (ackWindow >>> (24 - 8 * i));
+        }
         return payload;
     }
 
     public static byte decodePrepareAckStatus(byte[] payload) throws IOException {
-        if (payload.length != 17 || payload[0] != OP_PREPARE_ACK) {
-            throw new IOException("invalid prepare ack");
-        }
+        requirePrepareAck(payload);
         return payload[1];
     }
 
     public static long decodePrepareAckOffset(byte[] payload) throws IOException {
-        if (payload.length != 17 || payload[0] != OP_PREPARE_ACK) {
-            throw new IOException("invalid prepare ack");
-        }
+        requirePrepareAck(payload);
         long value = 0;
         for (int i = 9; i < 17; i++) {
             value = (value << 8) | (payload[i] & 0xFF);
         }
         return value;
+    }
+
+    public static int decodePrepareAckWindow(byte[] payload) throws IOException {
+        requirePrepareAck(payload);
+        int value = 0;
+        for (int i = 17; i < 21; i++) {
+            value = (value << 8) | (payload[i] & 0xFF);
+        }
+        return value < 1 ? 1 : value;
+    }
+
+    private static void requirePrepareAck(byte[] payload) throws IOException {
+        if (payload.length != 21 || payload[0] != OP_PREPARE_ACK) {
+            throw new IOException("invalid prepare ack");
+        }
     }
 
     public static byte[] encodeChunk(long offset, byte[] data, byte[] sha256) {

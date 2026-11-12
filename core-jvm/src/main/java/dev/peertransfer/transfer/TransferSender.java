@@ -17,6 +17,9 @@ import java.util.Arrays;
  * <p>Resume is driven by the receiver: the ack after PREPARE carries the contiguous verified prefix,
  * and this class continues at that byte offset. Each chunk is hashed locally and the hash travels with
  * it, so the receiver can reject a corrupt chunk without trusting the transport.
+ *
+ * <p>The receiver also dictates the acknowledgement window, so this side keeps that many chunks in
+ * flight instead of stalling on a round trip per chunk.
  */
 public final class TransferSender implements AutoCloseable {
 
@@ -44,10 +47,12 @@ public final class TransferSender implements AutoCloseable {
     public static final class Result {
         public final long bytesSent;
         public final boolean resumed;
+        public final int ackWindow;
 
-        Result(long bytesSent, boolean resumed) {
+        Result(long bytesSent, boolean resumed, int ackWindow) {
             this.bytesSent = bytesSent;
             this.resumed = resumed;
+            this.ackWindow = ackWindow;
         }
     }
 
@@ -82,6 +87,7 @@ public final class TransferSender implements AutoCloseable {
         byte[] prepareAck = channel.open(frames.read());
         byte status = Messages.decodePrepareAckStatus(prepareAck);
         long startOffset = Messages.decodePrepareAckOffset(prepareAck);
+        int window = Messages.decodePrepareAckWindow(prepareAck);
         if (status != Messages.STATUS_OK) {
             throw new IOException("receiver rejected the transfer, status " + status);
         }
@@ -91,6 +97,7 @@ public final class TransferSender implements AutoCloseable {
 
         ChunkPlan plan = new ChunkPlan(size, chunkBytes);
         long sent = 0;
+        int inFlight = 0;
         try (java.io.RandomAccessFile file = new java.io.RandomAccessFile(source.toFile(), "r")) {
             int index = plan.resumeIndex(startOffset);
             byte[] buffer = new byte[chunkBytes];
@@ -103,14 +110,20 @@ public final class TransferSender implements AutoCloseable {
                         : Arrays.copyOf(buffer, chunk.length());
                 frames.write(channel.seal(Messages.encodeChunk(chunk.offset(), data, sha256(data))));
                 sent += data.length;
-
-                byte[] chunkAck = channel.open(frames.read());
-                byte chunkStatus = Messages.decodeChunkAckStatus(chunkAck);
-                if (chunkStatus != Messages.STATUS_OK) {
-                    throw new IOException("receiver rejected chunk at " + chunk.offset()
-                            + ", status " + chunkStatus);
-                }
+                inFlight++;
                 index++;
+
+                // Run ahead by the receiver's window so the link stays busy; only then wait for acks.
+                boolean lastChunk = index >= plan.chunkCount();
+                if (inFlight >= window || lastChunk) {
+                    byte[] chunkAck = channel.open(frames.read());
+                    byte chunkStatus = Messages.decodeChunkAckStatus(chunkAck);
+                    if (chunkStatus != Messages.STATUS_OK) {
+                        throw new IOException("receiver rejected a chunk in the last window, status "
+                                + chunkStatus);
+                    }
+                    inFlight = 0;
+                }
             }
         }
 
@@ -119,7 +132,7 @@ public final class TransferSender implements AutoCloseable {
         if (doneStatus != Messages.STATUS_OK) {
             throw new IOException("receiver reported failure at completion, status " + doneStatus);
         }
-        return new Result(sent, startOffset > 0);
+        return new Result(sent, startOffset > 0, window);
     }
 
     private static byte[] sha256(byte[] data) {
